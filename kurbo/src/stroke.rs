@@ -214,6 +214,8 @@ pub struct StrokeCtx {
     start_tan: Vec2,
     last_pt: Point,
     last_tan: Vec2,
+    // Cached normal of last_tan (0.5 * width * unit_perp), used in miter computation.
+    last_norm: Vec2,
     // Precomputation of the join threshold, to optimize per-join logic.
     // If hypot < (hypot + dot) * join_thresh, omit join altogether.
     join_thresh: f64,
@@ -236,6 +238,7 @@ impl StrokeCtx {
         self.start_tan = Vec2::default();
         self.last_pt = Point::default();
         self.last_tan = Vec2::default();
+        self.last_norm = Vec2::default();
         self.join_thresh = 0.0;
     }
 }
@@ -428,7 +431,87 @@ impl StrokeCtx {
         if self.forward_path.is_empty() {
             return;
         }
-        self.do_join(style, self.start_tan);
+        // Compute the closure join between last_tan and start_tan
+        // and append it to forward/backward paths so that each forms
+        // a closed loop, avoiding repeated coverage at the seam.
+        let p0 = self.last_pt;
+        let ab = self.last_tan;
+        let cd = self.start_tan;
+        let ab_len = ab.hypot();
+        let cd_len = cd.hypot();
+
+        if ab_len == 0.0 || cd_len == 0.0 {
+            self.forward_path.truncate(0);
+            self.backward_path.truncate(0);
+            return;
+        }
+
+        let norm_close = self.last_norm;
+        let norm_start = self.start_norm;
+
+        let cross = ab.cross(cd);
+        let dot = ab.dot(cd);
+        let hypot = cross.hypot(dot);
+        let tolerance = 1e-3;
+
+        // Add closure join to forward and backward paths (each gets one half)
+        if dot <= 0.0 || cross.abs() >= hypot * self.join_thresh {
+            match style.join {
+                Join::Bevel => {
+                    self.forward_path.line_to(p0 - norm_start);
+                    self.backward_path.line_to(p0 + norm_start);
+                }
+                Join::Miter => {
+                    let ab_unit = ab / ab_len;
+                    let cd_unit = cd / cd_len;
+                    let cross_unit = ab_unit.cross(cd_unit);
+                    let dot_unit = ab_unit.dot(cd_unit);
+                    let hypot_unit = cross_unit.hypot(dot_unit);
+                    if cross_unit.abs() > 1e-12
+                        && 2.0 * hypot_unit
+                            < (hypot_unit + dot_unit) * style.miter_limit.powi(2)
+                    {
+                        if cross > 0.0 {
+                            let fp_last = p0 - norm_close;
+                            let fp_this = p0 - norm_start;
+                            let h = ab_unit.cross(fp_this - fp_last) / cross_unit;
+                            let miter_pt = fp_this - cd_unit * h;
+                            self.forward_path.line_to(miter_pt);
+                            self.backward_path.line_to(p0);
+                        } else if cross < 0.0 {
+                            let fp_last = p0 + norm_close;
+                            let fp_this = p0 + norm_start;
+                            let h = ab_unit.cross(fp_this - fp_last) / cross_unit;
+                            let miter_pt = fp_this - cd_unit * h;
+                            self.backward_path.line_to(miter_pt);
+                            self.forward_path.line_to(p0);
+                        }
+                    }
+                    self.forward_path.line_to(p0 - norm_start);
+                    self.backward_path.line_to(p0 + norm_start);
+                }
+                Join::Round => {
+                    let angle = cross.atan2(dot);
+                    if angle > 0.0 {
+                        self.backward_path.line_to(p0 + norm_start);
+                        round_join(&mut self.forward_path, tolerance, p0, norm_start, angle);
+                    } else {
+                        self.forward_path.line_to(p0 - norm_start);
+                        round_join_rev(
+                            &mut self.backward_path,
+                            tolerance,
+                            p0,
+                            -norm_start,
+                            -angle,
+                        );
+                    }
+                }
+            }
+        }
+
+        // The forward and backward paths now each form a closed loop
+        // (they start and end at p0±norm_start).  Output them as two
+        // subpaths that together define the stroke fill.
         self.output.extend(&self.forward_path);
         self.output.close_path();
         let back_els = self.backward_path.elements();
@@ -441,16 +524,21 @@ impl StrokeCtx {
     }
 
     fn do_join(&mut self, style: &Stroke, tan0: Vec2) {
-        // TODO: scale
         let tolerance = 1e-3;
-        let scale = 0.5 * style.width / tan0.hypot();
-        let norm = scale * Vec2::new(-tan0.y, tan0.x);
+        // Normalize the incoming tangent so that stroke width is invariant
+        // under scaling and mirroring of the path.
+        let tan0_len = tan0.hypot();
+        if tan0_len == 0.0 {
+            return;
+        }
+        let norm = 0.5 * style.width * Vec2::new(-tan0.y, tan0.x) / tan0_len;
         let p0 = self.last_pt;
         if self.forward_path.elements().is_empty() {
             self.forward_path.move_to(p0 - norm);
             self.backward_path.move_to(p0 + norm);
             self.start_tan = tan0;
             self.start_norm = norm;
+            self.last_norm = norm;
         } else {
             let ab = self.last_tan;
             let cd = tan0;
@@ -465,28 +553,45 @@ impl StrokeCtx {
                         self.backward_path.line_to(p0 + norm);
                     }
                     Join::Miter => {
-                        if 2.0 * hypot < (hypot + dot) * style.miter_limit.powi(2) {
-                            // TODO: maybe better to store last_norm or derive from path?
-                            let last_scale = 0.5 * style.width / ab.hypot();
-                            let last_norm = last_scale * Vec2::new(-ab.y, ab.x);
-                            if cross > 0.0 {
-                                let fp_last = p0 - last_norm;
-                                let fp_this = p0 - norm;
-                                let h = ab.cross(fp_this - fp_last) / cross;
-                                let miter_pt = fp_this - cd * h;
-                                self.forward_path.line_to(miter_pt);
-                                self.backward_path.line_to(p0);
-                            } else if cross < 0.0 {
-                                let fp_last = p0 + last_norm;
-                                let fp_this = p0 + norm;
-                                let h = ab.cross(fp_this - fp_last) / cross;
-                                let miter_pt = fp_this - cd * h;
-                                self.backward_path.line_to(miter_pt);
-                                self.forward_path.line_to(p0);
+                        // Use normalized tangents for miter computation so that
+                        // the miter length is independent of path scale.
+                        let ab_len = ab.hypot();
+                        let cd_len = tan0_len;
+                        if ab_len == 0.0 || cd_len == 0.0 {
+                            self.forward_path.line_to(p0 - norm);
+                            self.backward_path.line_to(p0 + norm);
+                        } else {
+                            let ab_unit = ab / ab_len;
+                            let cd_unit = cd / cd_len;
+                            let cross_unit = ab_unit.cross(cd_unit);
+                            let dot_unit = ab_unit.dot(cd_unit);
+                            let hypot_unit = cross_unit.hypot(dot_unit);
+                            // Reject degenerate miters (near-parallel tangents produce
+                            // an unbounded miter intersection).
+                            if cross_unit.abs() > 1e-12
+                                && 2.0 * hypot_unit
+                                    < (hypot_unit + dot_unit) * style.miter_limit.powi(2)
+                            {
+                                let last_norm = self.last_norm;
+                                if cross > 0.0 {
+                                    let fp_last = p0 - last_norm;
+                                    let fp_this = p0 - norm;
+                                    let h = ab_unit.cross(fp_this - fp_last) / cross_unit;
+                                    let miter_pt = fp_this - cd_unit * h;
+                                    self.forward_path.line_to(miter_pt);
+                                    self.backward_path.line_to(p0);
+                                } else if cross < 0.0 {
+                                    let fp_last = p0 + last_norm;
+                                    let fp_this = p0 + norm;
+                                    let h = ab_unit.cross(fp_this - fp_last) / cross_unit;
+                                    let miter_pt = fp_this - cd_unit * h;
+                                    self.backward_path.line_to(miter_pt);
+                                    self.forward_path.line_to(p0);
+                                }
                             }
+                            self.forward_path.line_to(p0 - norm);
+                            self.backward_path.line_to(p0 + norm);
                         }
-                        self.forward_path.line_to(p0 - norm);
-                        self.backward_path.line_to(p0 + norm);
                     }
                     Join::Round => {
                         let angle = cross.atan2(dot);
@@ -504,11 +609,15 @@ impl StrokeCtx {
     }
 
     fn do_line(&mut self, style: &Stroke, tangent: Vec2, p1: Point) {
-        let scale = 0.5 * style.width / tangent.hypot();
-        let norm = scale * Vec2::new(-tangent.y, tangent.x);
+        let tan_len = tangent.hypot();
+        if tan_len == 0.0 {
+            return;
+        }
+        let norm = 0.5 * style.width * Vec2::new(-tangent.y, tangent.x) / tan_len;
         self.forward_path.line_to(p1 - norm);
         self.backward_path.line_to(p1 + norm);
         self.last_pt = p1;
+        self.last_norm = norm;
     }
 
     fn do_cubic(&mut self, style: &Stroke, c: CubicBez, tolerance: f64) {
