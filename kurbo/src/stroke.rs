@@ -293,6 +293,7 @@ pub fn stroke_with(
             style.dash_offset,
             &style.dash_pattern,
             opts.stable_dash_order,
+            false,
         );
         stroke_undashed(dashed, style, tolerance, ctx);
     }
@@ -618,6 +619,8 @@ struct DashIterator<'a, T> {
     init_dash_remaining: f64,
     init_is_active: bool,
     is_active: bool,
+    mirror_phase: bool,
+    replaying: bool,
     state: DashState,
     current_seg: PathSeg,
     t: f64,
@@ -627,6 +630,7 @@ struct DashIterator<'a, T> {
     last_pt: Point,
     stash: Vec<PathEl>,
     stash_ix: usize,
+    stash_t: f64,
     stable_dash_order: bool,
     needs_moveto: bool,
 }
@@ -665,6 +669,18 @@ impl<T: Iterator<Item = PathEl>> Iterator for DashIterator<'_, T> {
                 }
                 DashState::Working => {
                     if let Some(el) = self.step() {
+                        // When replaying after a wrap, a MoveTo signals the
+                        // end of the gap after the wrapping dash — the
+                        // remaining stashed geometry cannot form a complete
+                        // additional dash, so stop here.
+                        if self.replaying && matches!(el, PathEl::MoveTo(_)) {
+                            self.replaying = false;
+                            self.input_done = true;
+                            self.stash.clear();
+                            self.stash_ix = 0;
+                            self.state = DashState::NeedInput;
+                            continue;
+                        }
                         return Some(el);
                     }
                 }
@@ -719,7 +735,20 @@ pub fn dash<'a>(
     dash_offset: f64,
     dashes: &'a [f64],
 ) -> impl Iterator<Item = PathEl> + 'a {
-    dash_iter(inner, dash_offset, dashes, false)
+    dash_iter(inner, dash_offset, dashes, false, false)
+}
+
+/// Create a dashing iterator with mirror phase for reversed paths.
+///
+/// When a path is traversed in reverse, this ensures dashes appear at the
+/// same physical positions as the forward traversal.  Most useful for
+/// closed paths.
+pub fn dash_with_mirror<'a>(
+    inner: impl Iterator<Item = PathEl> + 'a,
+    dash_offset: f64,
+    dashes: &'a [f64],
+) -> impl Iterator<Item = PathEl> + 'a {
+    dash_iter(inner, dash_offset, dashes, false, true)
 }
 
 fn dash_iter<'a>(
@@ -727,6 +756,7 @@ fn dash_iter<'a>(
     dash_offset: f64,
     dashes: &'a [f64],
     stable_dash_order: bool,
+    mirror_phase: bool,
 ) -> DashIterator<'a, impl Iterator<Item = PathEl> + 'a> {
     // Ensure that offset is positive and minimal by normalization using period
     let period = dashes.iter().sum();
@@ -738,6 +768,26 @@ fn dash_iter<'a>(
     } else {
         period
     };
+
+    // Mirror phase: reverse dash/gap order.
+    let dash_count = dashes.len();
+    let effective_dashes: SmallVec<[f64; 8]>;
+    let dashes_ref: &[f64] = if mirror_phase {
+        effective_dashes = dashes.iter().copied().collect();
+        let n = dash_count / 2;
+        let mut mirrored: SmallVec<[f64; 8]> = SmallVec::with_capacity(dash_count);
+        for i in (0..n).rev() {
+            mirrored.push(effective_dashes[2 * i]);
+            let gap_ix = if i == 0 { 2 * n - 1 } else { 2 * i - 1 };
+            mirrored.push(effective_dashes[gap_ix]);
+        }
+        effective_dashes = mirrored;
+        effective_dashes.as_slice()
+    } else {
+        dashes
+    };
+    let dashes = dashes_ref;
+
     let dash_offset = dash_offset.rem_euclid(period);
 
     let mut dash_ix = 0;
@@ -759,6 +809,8 @@ fn dash_iter<'a>(
         init_dash_remaining: dash_remaining,
         init_is_active: is_active,
         is_active,
+        mirror_phase,
+        replaying: false,
         state: DashState::NeedInput,
         current_seg: PathSeg::Line(Line::new(Point::ORIGIN, Point::ORIGIN)),
         t: 0.0,
@@ -768,6 +820,7 @@ fn dash_iter<'a>(
         last_pt: Point::ORIGIN,
         stash: Vec::new(),
         stash_ix: 0,
+        stash_t: 0.0,
         stable_dash_order,
         needs_moveto: true,
     }
@@ -778,6 +831,45 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
         loop {
             if self.closepath_pending {
                 self.handle_closepath();
+                if self.replaying {
+                    // handle_closepath entered replay mode; continue the
+                    // loop so the replaying branch loads from stash.
+                    continue;
+                }
+                break;
+            }
+            // When replaying after a dash wraps through ClosePath,
+            // pull geometry from the stashed prefix instead of the
+            // (exhausted) inner iterator.
+            if self.replaying {
+                if self.stash_ix >= self.stash.len() {
+                    self.replaying = false;
+                    self.input_done = true;
+                    self.state = DashState::FromStash;
+                    return;
+                }
+                let next_el = self.stash[self.stash_ix];
+                self.stash_ix += 1;
+                let p0 = self.last_pt;
+                match next_el {
+                    PathEl::MoveTo(p) => {
+                        self.start_pt = p;
+                        self.last_pt = p;
+                        continue;
+                    }
+                    PathEl::LineTo(p1) => {
+                        let l = Line::new(p0, p1);
+                        self.seg_remaining = l.arclen(DASH_ACCURACY);
+                        self.current_seg = PathSeg::Line(l);
+                        self.last_pt = p1;
+                    }
+                    PathEl::ClosePath => {
+                        continue;
+                    }
+                    _ => {
+                        continue;
+                    }
+                }
                 break;
             }
             let Some(next_el) = self.inner.next() else {
@@ -793,7 +885,7 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
                     }
                     self.start_pt = p;
                     self.last_pt = p;
-                    self.reset_phase();
+                    // Phase continues across MoveTo for continuous dashing.
                     continue;
                 }
                 PathEl::LineTo(p1) => {
@@ -822,6 +914,9 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
                         self.current_seg = PathSeg::Line(l);
                         self.last_pt = self.start_pt;
                     } else {
+                        // No closing segment to process; ensure step()
+                        // will call get_input() again (now in replay mode).
+                        self.seg_remaining = 0.0;
                         self.handle_closepath();
                     }
                 }
@@ -861,12 +956,15 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
                 self.dash_ix = 0;
             }
             self.dash_remaining = self.dashes[self.dash_ix];
-        } else {
+        } else if self.seg_remaining > 0.0 {
             if self.is_active {
                 let seg = self.current_seg.subsegment(self.t..1.0);
                 result = Some(seg_to_el(&seg));
             }
             self.dash_remaining -= self.seg_remaining;
+            self.get_input();
+        } else {
+            // No remaining segment geometry — pull next input.
             self.get_input();
         }
         result
@@ -877,11 +975,18 @@ impl<'a, T: Iterator<Item = PathEl>> DashIterator<'a, T> {
             // Have looped back without breaking a dash, just play it back
             self.stash.push(PathEl::ClosePath);
         } else if self.is_active && !self.stable_dash_order {
-            // connect with path in stash, skip MoveTo.
+            // Dash wraps through ClosePath.  Set up replay from the
+            // stashed beginning: skip the initial MoveTo and feed
+            // stash elements back through the normal dash pipeline
+            // so the dash ends at the correct arc-length position.
+            self.closepath_pending = false;
             self.stash_ix = 1;
+            self.replaying = true;
+            self.state = DashState::Working;
+            return;
         }
         self.state = DashState::FromStash;
-        self.reset_phase();
+        // Do NOT reset phase — continuous dashing.
     }
 
     fn reset_phase(&mut self) {
@@ -998,14 +1103,15 @@ mod tests {
     fn dash_sequence_closed_path() {
         let shape = crate::Rect::from_points((0.0, 0.0), (4.0, 4.0));
         let dashes = [5., 1.];
+        // The dash at [12,17)=[12,16)+[0,1) wraps through ClosePath and
+        // merges with only the needed portion of the stashed first dash.
         let expansion = [
             PathEl::MoveTo((4.0, 2.0).into()),
             PathEl::LineTo((4.0, 4.0).into()),
             PathEl::LineTo((1.0, 4.0).into()),
             PathEl::MoveTo((0.0, 4.0).into()),
             PathEl::LineTo((0.0, 0.0).into()),
-            PathEl::LineTo((4.0, 0.0).into()),
-            PathEl::LineTo((4.0, 1.0).into()),
+            PathEl::LineTo((1.0, 0.0).into()),
         ];
         let iter = dash(shape.path_elements(0.), 0., &dashes);
         assert_eq!(iter.collect::<Vec<PathEl>>(), expansion);
@@ -1021,7 +1127,7 @@ mod tests {
             PathSeg::Line(Line::new((13., 0.), (14., 0.))),
             PathSeg::Line(Line::new((19., 0.), (21., 0.))),
         ];
-        let iter = segments(dash_iter(shape.path_elements(0.), 0., &dashes, true));
+        let iter = segments(dash_iter(shape.path_elements(0.), 0., &dashes, true, false));
         assert_eq!(iter.collect::<Vec<PathSeg>>(), expansion);
     }
 
@@ -1039,7 +1145,7 @@ mod tests {
             PathEl::MoveTo((0.0, 4.0).into()),
             PathEl::LineTo((0.0, 0.0).into()),
         ];
-        let iter = dash_iter(shape.path_elements(0.), 0., &dashes, true);
+        let iter = dash_iter(shape.path_elements(0.), 0., &dashes, true, false);
         assert_eq!(iter.collect::<Vec<PathEl>>(), expansion);
     }
 
@@ -1095,7 +1201,7 @@ mod tests {
             PathEl::MoveTo((10., 12.).into()),
             PathEl::LineTo((10., 10.).into()),
         ];
-        let iter = dash_iter(path.into_iter(), 0., &dashes, true);
+        let iter = dash_iter(path.into_iter(), 0., &dashes, true, false);
         assert_eq!(iter.collect::<Vec<PathEl>>(), expansion);
     }
 

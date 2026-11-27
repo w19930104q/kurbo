@@ -181,7 +181,7 @@ pub use crate::rounded_rect_radii::RoundedRectRadii;
 pub use crate::shape::Shape;
 pub use crate::size::Size;
 pub use crate::stroke::{
-    Cap, Dashes, Join, Stroke, StrokeCtx, StrokeOptLevel, StrokeOpts, dash, stroke, stroke_with,
+    Cap, Dashes, Join, Stroke, StrokeCtx, StrokeOptLevel, StrokeOpts, dash, dash_with_mirror, stroke, stroke_with,
 };
 pub use crate::svg::{SvgArc, SvgParseError};
 pub use crate::translate_scale::TranslateScale;
