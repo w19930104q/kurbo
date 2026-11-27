@@ -3,7 +3,7 @@
 
 //! An ellipse arc.
 
-use crate::{Affine, Ellipse, ParamCurve, PathEl, Point, Rect, Shape, Vec2};
+use crate::{Affine, ParamCurve, PathEl, Point, Rect, Shape, Vec2};
 use core::{
     f64::consts::{FRAC_PI_2, PI},
     iter,
@@ -232,22 +232,81 @@ impl Mul<Arc> for Affine {
     type Output = Arc;
 
     fn mul(self, arc: Arc) -> Self::Output {
-        let ellipse = self * Ellipse::new(arc.center, arc.radii, arc.x_rotation);
-        let center = ellipse.center();
-        let (radii, rotation) = ellipse.radii_and_rotation();
+        let ell_aff = self
+            * Affine::translate(arc.center.to_vec2())
+            * Affine::rotate(arc.x_rotation)
+            * Affine::scale_non_uniform(arc.radii.x, arc.radii.y);
+        let coeffs = ell_aff.as_coeffs();
+        let center = Point::new(coeffs[4], coeffs[5]);
+        let (radii, rotation, start_angle, sweep_angle) =
+            svd_arc_angles(ell_aff, arc.start_angle, arc.sweep_angle);
         Arc {
             center,
             radii,
             x_rotation: rotation,
-            start_angle: arc.start_angle,
-            sweep_angle: arc.sweep_angle,
+            start_angle,
+            sweep_angle,
         }
     }
 }
 
+fn svd_arc_angles(
+    ell_aff: Affine,
+    orig_start_angle: f64,
+    orig_sweep_angle: f64,
+) -> (Vec2, f64, f64, f64) {
+    let coeffs = ell_aff.as_coeffs();
+    let (a, b, c, d, _e, _f) = (coeffs[0], coeffs[1], coeffs[2], coeffs[3], coeffs[4], coeffs[5]);
+
+    let a2 = a * a;
+    let b2 = b * b;
+    let c2 = c * c;
+    let d2 = d * d;
+    let s1 = ((a + d).powi(2) + (b - c).powi(2)).sqrt();
+    let s2 = ((a - d).powi(2) + (b + c).powi(2)).sqrt();
+    let sigma_x = 0.5 * (s1 + s2);
+    let sigma_y = 0.5 * (s1 - s2).abs();
+
+    let u_angle = if (sigma_x - sigma_y).abs() < 1e-12 * sigma_x.max(1.0) {
+        b.atan2(a)
+    } else {
+        0.5 * (2.0 * (a * b + c * d)).atan2(a2 - b2 + c2 - d2)
+    };
+
+    let (su, cu) = u_angle.sin_cos();
+    let ut_l_11 = cu * a + su * b;
+    let ut_l_12 = cu * c + su * d;
+    let ut_l_21 = -su * a + cu * b;
+    let ut_l_22 = -su * c + cu * d;
+
+    let vt_11 = ut_l_11 / sigma_x;
+    let vt_12 = ut_l_12 / sigma_x;
+    let vt_21 = ut_l_21 / sigma_y;
+    let vt_22 = ut_l_22 / sigma_y;
+
+    let det_vt = vt_11 * vt_22 - vt_12 * vt_21;
+    let v_phi = (-vt_21).atan2(vt_11);
+
+    let (new_start, new_sweep) = if det_vt >= 0.0 {
+        (orig_start_angle - v_phi, orig_sweep_angle)
+    } else {
+        (v_phi - orig_start_angle, -orig_sweep_angle)
+    };
+
+    (
+        Vec2 {
+            x: sigma_x,
+            y: sigma_y,
+        },
+        u_angle,
+        new_start,
+        new_sweep,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use core::f64::consts::{FRAC_PI_4, FRAC_PI_6};
+    use core::f64::consts::{FRAC_PI_4, FRAC_PI_6, PI};
 
     use crate::ParamCurve;
 
@@ -339,4 +398,138 @@ mod tests {
         let arc = Arc::new((0.0, 0.0), (2.0, 1.0), 1.0, 1e-9, FRAC_PI_4);
         assert_subsegment_matches(arc, 0.25..0.75);
     }
+    #[test]
+    fn affine_arc_semicircle_rotate_scale() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI, 0.0);
+        let affine = Affine::rotate(PI / 4.0) * Affine::scale_non_uniform(2.0, 1.0);
+        let tarc = affine * arc;
+        assert_point_near(tarc.start(), affine * arc.start());
+        assert_point_near(tarc.end(), affine * arc.end());
+        assert_point_near(tarc.eval(0.5), affine * arc.eval(0.5));
+    }
+
+    #[test]
+    fn affine_arc_quarter_rotate_scale() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI / 2.0, 0.0);
+        let affine = Affine::rotate(PI / 4.0) * Affine::scale_non_uniform(2.0, 1.0);
+        let tarc = affine * arc;
+        assert_point_near(tarc.start(), affine * arc.start());
+        assert_point_near(tarc.end(), affine * arc.end());
+        assert_point_near(tarc.eval(0.5), affine * arc.eval(0.5));
+    }
+
+    #[test]
+    fn affine_arc_semicircle_flip_x() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI, 0.0);
+        let tarc = Affine::FLIP_X * arc;
+        assert_point_near(tarc.start(), Affine::FLIP_X * arc.start());
+        assert_point_near(tarc.end(), Affine::FLIP_X * arc.end());
+        assert_point_near(tarc.eval(0.5), Affine::FLIP_X * arc.eval(0.5));
+    }
+
+    #[test]
+    fn affine_arc_semicircle_flip_y() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI, 0.0);
+        let tarc = Affine::FLIP_Y * arc;
+        assert_point_near(tarc.start(), Affine::FLIP_Y * arc.start());
+        assert_point_near(tarc.end(), Affine::FLIP_Y * arc.end());
+        assert_point_near(tarc.eval(0.5), Affine::FLIP_Y * arc.eval(0.5));
+    }
+
+    #[test]
+    fn affine_arc_quarter_flip_x() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI / 2.0, 0.0);
+        let tarc = Affine::FLIP_X * arc;
+        assert_point_near(tarc.start(), Affine::FLIP_X * arc.start());
+        assert_point_near(tarc.end(), Affine::FLIP_X * arc.end());
+        assert_point_near(tarc.eval(0.5), Affine::FLIP_X * arc.eval(0.5));
+    }
+
+    #[test]
+    fn affine_arc_quarter_flip_y() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI / 2.0, 0.0);
+        let tarc = Affine::FLIP_Y * arc;
+        assert_point_near(tarc.start(), Affine::FLIP_Y * arc.start());
+        assert_point_near(tarc.end(), Affine::FLIP_Y * arc.end());
+        assert_point_near(tarc.eval(0.5), Affine::FLIP_Y * arc.eval(0.5));
+    }
+
+    #[test]
+    fn affine_arc_semicircle_uniform_scale() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI, 0.0);
+        let tarc = Affine::scale(5.0) * arc;
+        assert_point_near(tarc.start(), Affine::scale(5.0) * arc.start());
+        assert_point_near(tarc.end(), Affine::scale(5.0) * arc.end());
+        assert_point_near(tarc.eval(0.5), Affine::scale(5.0) * arc.eval(0.5));
+    }
+
+    #[test]
+    fn affine_arc_quarter_uniform_scale() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI / 2.0, 0.0);
+        let tarc = Affine::scale(5.0) * arc;
+        assert_point_near(tarc.start(), Affine::scale(5.0) * arc.start());
+        assert_point_near(tarc.end(), Affine::scale(5.0) * arc.end());
+        assert_point_near(tarc.eval(0.5), Affine::scale(5.0) * arc.eval(0.5));
+    }
+
+    #[test]
+    fn affine_arc_negative_sweep_rotate() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), PI, -PI / 2.0, 0.0);
+        let tarc = Affine::rotate(PI / 3.0) * arc;
+        assert_point_near(tarc.start(), Affine::rotate(PI / 3.0) * arc.start());
+        assert_point_near(tarc.end(), Affine::rotate(PI / 3.0) * arc.end());
+        assert_point_near(tarc.eval(0.5), Affine::rotate(PI / 3.0) * arc.eval(0.5));
+    }
+
+    #[test]
+    fn affine_arc_negative_sweep_flip() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), PI, -PI / 2.0, 0.0);
+        let tarc = Affine::FLIP_X * arc;
+        assert_point_near(tarc.start(), Affine::FLIP_X * arc.start());
+        assert_point_near(tarc.end(), Affine::FLIP_X * arc.end());
+        assert_point_near(tarc.eval(0.5), Affine::FLIP_X * arc.eval(0.5));
+    }
+
+    #[test]
+    fn affine_arc_sweep_sign_preserved() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI, 0.0);
+        assert!(arc.sweep_angle > 0.0);
+        assert!((Affine::FLIP_X * arc).sweep_angle < 0.0);
+        assert!((Affine::FLIP_Y * arc).sweep_angle < 0.0);
+        assert!((Affine::rotate(PI / 4.0) * arc).sweep_angle > 0.0);
+        assert!((Affine::scale(2.0) * arc).sweep_angle > 0.0);
+    }
+
+    #[test]
+    fn affine_arc_start_angle_changes() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI, 0.0);
+        let affine = Affine::rotate(PI / 4.0) * Affine::scale_non_uniform(2.0, 1.0);
+        let tarc = affine * arc;
+        let tarc2 = Affine::rotate(PI / 3.0) * arc;
+        assert_point_near(tarc.start(), affine * arc.start());
+        assert_point_near(tarc.end(), affine * arc.end());
+        assert_point_near(tarc2.start(), Affine::rotate(PI / 3.0) * arc.start());
+        assert_point_near(tarc2.end(), Affine::rotate(PI / 3.0) * arc.end());
+    }
+
+    #[test]
+    fn affine_arc_endpoints_continuous() {
+        let arc = Arc::new((0.0, 0.0), (100.0, 100.0), 0.0, PI, 0.0);
+        let affine = Affine::rotate(PI / 4.0) * Affine::scale_non_uniform(2.0, 1.0);
+        let tarc = affine * arc;
+
+        let tol = 0.1;
+        let pts: Vec<Point> = tarc
+            .path_elements(tol)
+            .map(|el| match el {
+                PathEl::MoveTo(p) => p,
+                PathEl::CurveTo(_, _, p3) => p3,
+                _ => Point::new(0.0, 0.0),
+            })
+            .collect();
+
+        assert_point_near(pts[0], tarc.start());
+        assert_point_near(pts[pts.len() - 1], tarc.end());
+    }
+
 }
